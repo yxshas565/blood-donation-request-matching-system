@@ -1,0 +1,5 @@
+import 'dotenv/config';
+import bcrypt from 'bcryptjs';
+import {mysqlPool} from '../config/mysql.js';
+const {ADMIN_NAME,ADMIN_EMAIL,ADMIN_PHONE,ADMIN_PASSWORD}=process.env;
+if(!ADMIN_NAME||!ADMIN_EMAIL||!ADMIN_PASSWORD||ADMIN_PASSWORD.length<12){console.error('Set ADMIN_NAME, ADMIN_EMAIL and a 12+ character ADMIN_PASSWORD before bootstrap.');process.exitCode=1;}else try{const email=ADMIN_EMAIL.trim().toLowerCase();const [rows]=await mysqlPool.execute('SELECT User_ID,Role FROM `User` WHERE Email=?',[email]);if(rows.length){if(rows[0].Role!=='Admin')throw new Error('Email exists for a non-admin account.');console.log('Admin already exists; no changes made.');}else{const hash=await bcrypt.hash(ADMIN_PASSWORD,12);await mysqlPool.execute('INSERT INTO `User` (Name,Email,Phone,Password,Role) VALUES (?,?,?,?,\'Admin\')',[ADMIN_NAME,email,ADMIN_PHONE||null,hash]);console.log('Admin account created.');}}catch(e){console.error('Admin bootstrap failed:',e.message);process.exitCode=1;}finally{await mysqlPool.end();}
