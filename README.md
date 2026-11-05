@@ -175,9 +175,11 @@ The original relational baseline contains `User`, `BloodGroup`, `Donor`, `Donati
 The database implementation includes:
 
 - Primary keys, foreign keys, unique constraints, a request-owner `CHECK` constraint, and composite indexes.
-- Three views: `vw_AvailableDonors`, `vw_HospitalInventorySummary`, and `vw_PendingBloodRequests`.
+- Three views: `vw_availabledonors`, `vw_hospitalinventorysummary`, and `vw_pendingbloodrequests`.
 - Stored procedure: `sp_FindCompatibleDonors`.
 - Stored function: `fn_ApprovedDonationCount`.
+- Migration `003_advanced_database_objects.js` installs these views, routines and supporting indexes.
+- The JavaScript matching service calls `sp_FindCompatibleDonors` and `fn_ApprovedDonationCount` through parameterized MySQL queries; MongoDB continues to provide optional geospatial ranking.
 - Donation insert/update triggers that recalculate the latest approved donation date.
 - Transactions and row locking for donation approval and inventory credit, and for request fulfilment and inventory deduction.
 - A transactional outbox for durable, retryable MySQL-to-MongoDB event delivery.
@@ -255,7 +257,7 @@ The project verification recorded:
 - Next.js production build successful.
 - Manual role-based application workflows exercised for Admin, Hospital, Organization, and Donor roles.
 
-These results describe the recorded local verification run; they are not a claim that the repository's current GitHub default branch already contains every local change.
+These results describe the verified implementation committed and pushed to the GitHub main branch at `dffe37a`.
 
 ## Project report
 
