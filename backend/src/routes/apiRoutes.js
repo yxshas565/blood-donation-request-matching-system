@@ -106,8 +106,16 @@ router.get('/donors/me/donations', authorize('Donor'), asyncRoute(async (req, re
 }));
 
 router.get('/donors/:id', asyncRoute(async (req, res) => {
-  if (!canReadDonorDetails(req.user.role)) return res.sendStatus(403);
   if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid donor ID' });
+  if (req.user.role === 'Donor') {
+    const [[ownDonor]] = await mysqlPool.execute(
+      'SELECT Donor_ID FROM Donor WHERE User_ID=?',
+      [req.user.userId]
+    );
+    if (Number(ownDonor?.Donor_ID) !== Number(req.params.id)) return res.sendStatus(403);
+  } else if (!canReadDonorDetails(req.user.role)) {
+    return res.sendStatus(403);
+  }
   const [rows] = await mysqlPool.execute(
     `SELECT d.Donor_ID,u.Name,d.Availability_Status,d.Last_Donation_Date,b.Blood_Type,b.Rh_Factor
        FROM Donor d JOIN \`User\` u USING(User_ID) JOIN BloodGroup b USING(BloodGroup_ID)
@@ -296,6 +304,56 @@ router.patch('/requests/:id/status', authorize('Hospital', 'Organization', 'Admi
   res.json({ request: updated, syncStatus });
 }));
 
+router.delete('/requests/:id', authorize('Hospital', 'Organization', 'Admin'), asyncRoute(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid request ID' });
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let request;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute(
+      'SELECT * FROM BloodRequest WHERE Request_ID=? FOR UPDATE',
+      [req.params.id]
+    );
+    request = rows[0];
+    if (!request) throw statusError('Request not found', 404);
+    if (req.user.role !== 'Admin') {
+      const owner = await ownerFor(req.user, connection);
+      const ownerId = request.Hospital_ID ? owner.Hospital_ID : owner.Organization_ID;
+      const requestOwner = request.Hospital_ID || request.Organization_ID;
+      if (!ownerId || Number(ownerId) !== Number(requestOwner)) {
+        throw statusError('Forbidden', 403);
+      }
+    }
+    if (!['Pending', 'Partially_Fulfilled'].includes(request.Request_Status)) {
+      throw statusError('Only pending or partially fulfilled requests can be deleted', 409);
+    }
+    await connection.execute(
+      "UPDATE BloodRequest SET Request_Status='Cancelled' WHERE Request_ID=?",
+      [req.params.id]
+    );
+    const recipient = await userForRequestOwner(request, connection);
+    if (recipient) {
+      eventIds.push(await enqueueNotification(connection, {
+        recipientUserId: recipient,
+        recipientRole: request.Hospital_ID ? 'Hospital' : 'Organization',
+        title: 'Request cancelled',
+        message: `Request ${request.Request_ID} was cancelled.`,
+        type: 'RequestStatus',
+        relatedRequestId: Number(request.Request_ID),
+        dedupeKey: `request-deleted:${request.Request_ID}`
+      }));
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  const syncStatus = eventIds.length ? await syncResult(eventIds) : 'synced';
+  res.json({ message: 'Request cancelled successfully', requestId: Number(request.Request_ID), syncStatus });
+}));
 router.post('/requests/:id/fulfil', authorize('Hospital', 'Admin'), asyncRoute(async (req, res) => {
   if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid request ID' });
   const connection = await mysqlPool.getConnection();

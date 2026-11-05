@@ -98,3 +98,11 @@ export const adminApi = {
   integrationStatus: (limit = 50) => api(`/admin/integration/status?limit=${encodeURIComponent(limit)}`),
   retryIntegrationEvent: (id) => api(`/admin/integration/outbox/${id}/retry`, { method: 'POST', body: {} }),
 };
+
+
+export const sqlPlaygroundApi = {
+  execute: (sql) => api('/sql-playground/execute', {
+    method: 'POST',
+    body: { sql }
+  })
+};

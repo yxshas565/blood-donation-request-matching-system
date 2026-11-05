@@ -36,6 +36,7 @@ const navByRole = {
     { label: 'Inventory', to: '/app/inventory', icon: Boxes },
     { label: 'Hospitals & groups', to: '/app/organizations', icon: BriefcaseMedical },
     { label: 'Integration status', to: '/app/integration', icon: Settings2 },
+    { label: 'SQL Playground', to: '/app/sql-playground', icon: Settings2 },
     { label: 'Notifications', to: '/app/notifications', icon: Bell },
   ],
 };
@@ -45,6 +46,7 @@ const titleFor = {
   '/app/matching': 'Donor matching', '/app/inventory': 'Blood inventory', '/app/donations': 'Donations',
   '/app/notifications': 'Notifications', '/app/users': 'User directory', '/app/donors': 'Donor directory', '/app/integration': 'Integration status',
   '/app/organizations': 'Hospitals & organizations',
+  '/app/sql-playground': 'SQL Playground',
 };
 
 export function SkipLink({ target = 'workspace-main' }) { return <a className="skip-link sr-only focus:not-sr-only" href={`#${target}`}>Skip to main content</a>; }

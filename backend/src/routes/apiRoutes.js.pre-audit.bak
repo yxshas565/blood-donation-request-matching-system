@@ -1,0 +1,569 @@
+import { Router } from 'express';
+import { mysqlPool } from '../config/mysql.js';
+import { getMongoDB } from '../config/mongodb.js';
+import { requireAuth, authorize } from '../middleware/auth.js';
+import { groupLabel, eligibleDonorRecipients, matchDonors, ownerFor } from '../services/domain.js';
+import { dateOnly } from '../services/dates.js';
+import { enqueueNotification, enqueueOutbox } from '../services/outbox.js';
+import { getOutboxStatus, processOutboxOne, retryOutboxEvent } from '../services/outboxWorker.js';
+import { canFulfilHospitalRequest, canReadDonorDetails, canReviewDonation, inventoryAccess, requestDetailAccess, requestListAccess } from '../services/accessPolicy.js';
+
+const router = Router();
+const asyncRoute = handler => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+const isPositive = value => Number.isFinite(Number(value)) && Number(value) > 0 && Number(value) <= 999.99;
+const validId = value => /^\d+$/.test(String(value)) && Number(value) > 0;
+const statusError = (message, status = 400) => Object.assign(new Error(message), { status });
+
+function coordinateQuery(query) {
+  const hasLongitude = query.longitude !== undefined;
+  const hasLatitude = query.latitude !== undefined;
+  if (!hasLongitude && !hasLatitude) return { coords: null };
+  if (hasLongitude !== hasLatitude) return { error: 'Both longitude and latitude are required' };
+  const coords = [Number(query.longitude), Number(query.latitude)];
+  if (!coords.every(Number.isFinite) || Math.abs(coords[0]) > 180 || Math.abs(coords[1]) > 90) return { error: 'Invalid coordinates' };
+  return { coords };
+}
+
+async function donationSnapshot(connection, donationId) {
+  const [rows] = await connection.execute(
+    `SELECT d.Donation_ID,d.Donor_ID,d.Hospital_ID,d.Donation_Date,d.Quantity,d.Donation_Status,
+            b.Blood_Type,b.Rh_Factor
+       FROM Donation d JOIN BloodGroup b ON b.BloodGroup_ID=d.BloodGroup_ID
+      WHERE d.Donation_ID=?`, [donationId]
+  );
+  const row = rows[0];
+  if (!row) throw statusError('Donation not found', 404);
+  return {
+    mysql_donation_id: Number(row.Donation_ID),
+    donor_id: Number(row.Donor_ID),
+    blood_group: groupLabel(row),
+    donation_date: dateOnly(row.Donation_Date),
+    quantity: Number(row.Quantity),
+    donation_status: row.Donation_Status,
+    hospital_id: row.Hospital_ID === null ? null : Number(row.Hospital_ID)
+  };
+}
+
+async function syncResult(eventIds) {
+  for (const id of eventIds) await processOutboxOne(id).catch(() => null);
+  const [rows] = await mysqlPool.execute(
+    `SELECT COUNT(*) AS pending FROM IntegrationOutbox WHERE Event_ID IN (?) AND Status<>'Processed'`, [eventIds]
+  );
+  return Number(rows[0]?.pending || 0) === 0 ? 'synced' : 'pending';
+}
+
+async function userForRequestOwner(request, connection = mysqlPool) {
+  const table = request.Hospital_ID ? 'Hospital' : 'Organization';
+  const key = request.Hospital_ID ? 'Hospital_ID' : 'Organization_ID';
+  const [rows] = await connection.execute(`SELECT User_ID FROM ${table} WHERE ${key}=? LIMIT 1`, [request[key]]);
+  return rows[0]?.User_ID;
+}
+
+router.use(requireAuth);
+
+router.get('/users/me', asyncRoute(async (req, res) => {
+  const [rows] = await mysqlPool.execute('SELECT User_ID,Name,Email,Phone,Role FROM `User` WHERE User_ID=?', [req.user.userId]);
+  if (!rows[0]) return res.sendStatus(404);
+  res.json({ user: rows[0] });
+}));
+
+router.get('/donors/me', authorize('Donor'), asyncRoute(async (req, res) => {
+  const [rows] = await mysqlPool.execute(
+    `SELECT d.*,b.Blood_Type,b.Rh_Factor,u.Name,u.Email,u.Phone
+       FROM Donor d JOIN BloodGroup b USING(BloodGroup_ID) JOIN \`User\` u USING(User_ID)
+      WHERE d.User_ID=?`, [req.user.userId]
+  );
+  if (!rows[0]) return res.status(404).json({ message: 'Donor not found' });
+  res.json({ donor: rows[0] });
+}));
+
+router.patch('/donors/me/availability', authorize('Donor'), asyncRoute(async (req, res) => {
+  if (typeof req.body.available !== 'boolean') return res.status(400).json({ message: 'available must be boolean' });
+  const [result] = await mysqlPool.execute('UPDATE Donor SET Availability_Status=? WHERE User_ID=?', [req.body.available, req.user.userId]);
+  if (!result.affectedRows) return res.sendStatus(404);
+  res.json({ availability: req.body.available });
+}));
+
+router.put('/donors/me/location', authorize('Donor'), asyncRoute(async (req, res) => {
+  const { longitude, latitude, city, area } = req.body;
+  if (!Number.isFinite(longitude) || !Number.isFinite(latitude) || Math.abs(longitude) > 180 || Math.abs(latitude) > 90) {
+    return res.status(400).json({ message: 'Valid longitude and latitude are required' });
+  }
+  const [[donor]] = await mysqlPool.execute('SELECT Donor_ID FROM Donor WHERE User_ID=?', [req.user.userId]);
+  if (!donor) return res.sendStatus(404);
+  await getMongoDB().collection('DonorLocation').updateOne(
+    { donor_id: Number(donor.Donor_ID) },
+    { $set: { donor_id: Number(donor.Donor_ID), donor_name: req.user.name || null, city: city || null, area: area || null, location: { type: 'Point', coordinates: [longitude, latitude] }, updated_at: new Date() } },
+    { upsert: true }
+  );
+  res.json({ message: 'Location saved' });
+}));
+
+router.get('/donors/me/donations', authorize('Donor'), asyncRoute(async (req, res) => {
+  const [[donor]] = await mysqlPool.execute('SELECT Donor_ID FROM Donor WHERE User_ID=?', [req.user.userId]);
+  const [rows] = await mysqlPool.execute('SELECT * FROM Donation WHERE Donor_ID=? ORDER BY Donation_Date DESC', [donor?.Donor_ID || 0]);
+  res.json({ donations: rows });
+}));
+
+router.get('/donors/:id', asyncRoute(async (req, res) => {
+  if (!canReadDonorDetails(req.user.role)) return res.sendStatus(403);
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid donor ID' });
+  const [rows] = await mysqlPool.execute(
+    `SELECT d.Donor_ID,u.Name,d.Availability_Status,d.Last_Donation_Date,b.Blood_Type,b.Rh_Factor
+       FROM Donor d JOIN \`User\` u USING(User_ID) JOIN BloodGroup b USING(BloodGroup_ID)
+      WHERE d.Donor_ID=?`, [req.params.id]
+  );
+  if (!rows[0]) return res.sendStatus(404);
+  res.json({ donor: rows[0] });
+}));
+
+router.get('/hospitals/for-donation', authorize('Donor'), asyncRoute(async (_req, res) => {
+  const [rows] = await mysqlPool.query('SELECT Hospital_ID,Hospital_Name,Address FROM Hospital ORDER BY Hospital_Name');
+  res.json({ hospitals: rows });
+}));
+
+for (const [role, path, table] of [['Hospital', 'hospitals', 'Hospital'], ['Organization', 'organizations', 'Organization']]) {
+  router.get(`/${path}/me`, authorize(role), asyncRoute(async (req, res) => {
+    const [rows] = await mysqlPool.execute(`SELECT * FROM ${table} WHERE User_ID=? LIMIT 1`, [req.user.userId]);
+    res.json({ profile: rows[0] || null });
+  }));
+}
+
+for (const [role, path, table, fields] of [
+  ['Hospital', 'hospitals', 'Hospital', [['hospitalName', 'Hospital_Name'], ['address', 'Address'], ['phone', 'Phone']]],
+  ['Organization', 'organizations', 'Organization', [['organizationName', 'Organization_Name'], ['address', 'Address'], ['phone', 'Phone'], ['organizationType', 'Organization_Type']]]
+]) {
+  router.patch(`/${path}/me`, authorize(role), asyncRoute(async (req, res) => {
+    const sets = [];
+    const values = [];
+    for (const [key, column] of fields) {
+      if (Object.hasOwn(req.body, key)) {
+        if (typeof req.body[key] !== 'string' && req.body[key] !== null) return res.status(400).json({ message: `${key} must be text` });
+        sets.push(`${column}=?`);
+        values.push(typeof req.body[key] === 'string' ? req.body[key].trim() || null : null);
+      }
+    }
+    if (!sets.length) return res.status(400).json({ message: 'No supported profile fields supplied' });
+    values.push(req.user.userId);
+    const [result] = await mysqlPool.execute(`UPDATE ${table} SET ${sets.join(',')} WHERE User_ID=?`, values);
+    if (!result.affectedRows) {
+      const [[found]] = await mysqlPool.execute(`SELECT ${table === 'Hospital' ? 'Hospital_ID' : 'Organization_ID'} FROM ${table} WHERE User_ID=?`, [req.user.userId]);
+      if (!found) return res.sendStatus(404);
+    }
+    const [rows] = await mysqlPool.execute(`SELECT * FROM ${table} WHERE User_ID=? LIMIT 1`, [req.user.userId]);
+    res.json({ profile: rows[0] });
+  }));
+}
+
+router.get('/inventory', authorize('Hospital', 'Admin'), asyncRoute(async (req, res) => {
+  const access = inventoryAccess(req.user.role, req.user.userId);
+  if (!access.allowed) return res.sendStatus(403);
+  if (access.systemWide) {
+    const [rows] = await mysqlPool.execute(
+      `SELECT i.*,h.Hospital_Name,b.Blood_Type,b.Rh_Factor FROM BloodInventory i
+       JOIN Hospital h USING(Hospital_ID) JOIN BloodGroup b USING(BloodGroup_ID)
+       WHERE i.Quantity_Available>0 ORDER BY h.Hospital_Name,b.Blood_Type,b.Rh_Factor`
+    );
+    return res.json({ inventory: rows });
+  }
+  const owner = await ownerFor(req.user);
+  if (!owner.Hospital_ID) return res.status(404).json({ message: 'Hospital profile not found' });
+  const [rows] = await mysqlPool.execute(
+    `SELECT i.*,b.Blood_Type,b.Rh_Factor FROM BloodInventory i JOIN BloodGroup b USING(BloodGroup_ID)
+      WHERE ${access.predicate} AND i.Quantity_Available>0`, access.values
+  );
+  res.json({ inventory: rows });
+}));
+
+router.get('/hospitals/me/inventory', authorize('Hospital'), asyncRoute(async (req, res) => {
+  const owner = await ownerFor(req.user);
+  if (!owner.Hospital_ID) return res.status(404).json({ message: 'Hospital profile not found' });
+  const [rows] = await mysqlPool.execute(
+    'SELECT i.*,b.Blood_Type,b.Rh_Factor FROM BloodInventory i JOIN BloodGroup b USING(BloodGroup_ID) WHERE Hospital_ID=?',
+    [owner.Hospital_ID]
+  );
+  res.json({ inventory: rows });
+}));
+
+router.get('/requests', asyncRoute(async (req, res) => {
+  const access = requestListAccess(req.user.role, req.user.userId);
+  if (!access.allowed) return res.sendStatus(403);
+  const filters = [];
+  const values = [];
+  if (req.query.status) {
+    if (!['Pending', 'Partially_Fulfilled', 'Fulfilled', 'Cancelled'].includes(req.query.status)) return res.status(400).json({ message: 'Invalid request status filter' });
+    filters.push('r.Request_Status=?'); values.push(req.query.status);
+  }
+  if (req.query.urgency) {
+    if (!['Low', 'Medium', 'High', 'Critical'].includes(req.query.urgency)) return res.status(400).json({ message: 'Invalid urgency filter' });
+    filters.push('r.Urgency=?'); values.push(req.query.urgency);
+  }
+  if (access.where) { filters.push(access.where); values.push(...access.values); }
+  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  const [rows] = await mysqlPool.execute(
+    `SELECT r.*,b.Blood_Type,b.Rh_Factor FROM BloodRequest r JOIN BloodGroup b USING(BloodGroup_ID)
+     ${where} ORDER BY r.Request_Date DESC`, values
+  );
+  res.json({ requests: rows });
+}));
+
+router.post('/requests', authorize('Hospital', 'Organization'), asyncRoute(async (req, res) => {
+  const { bloodGroupId, quantity, urgency = 'Medium' } = req.body;
+  if (!isPositive(quantity) || !Number.isInteger(Number(bloodGroupId)) || !['Low', 'Medium', 'High', 'Critical'].includes(urgency)) {
+    return res.status(400).json({ message: 'Valid bloodGroupId, positive quantity and urgency are required' });
+  }
+  const [[group]] = await mysqlPool.execute('SELECT Blood_Type,Rh_Factor FROM BloodGroup WHERE BloodGroup_ID=?', [Number(bloodGroupId)]);
+  if (!group) return res.status(400).json({ message: 'Unknown blood group' });
+  const owner = await ownerFor(req.user);
+  if (!owner.Hospital_ID && !owner.Organization_ID) return res.status(403).json({ message: 'No requester profile is associated with this account' });
+  const matching = await eligibleDonorRecipients(groupLabel(group));
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let requestId;
+  try {
+    await connection.beginTransaction();
+    const [result] = await connection.execute(
+      `INSERT INTO BloodRequest (Hospital_ID,Organization_ID,BloodGroup_ID,Quantity_Required,Urgency,Request_Status)
+       VALUES (?,?,?,?,?,'Pending')`,
+      [owner.Hospital_ID || null, owner.Organization_ID || null, Number(bloodGroupId), Number(quantity), urgency]
+    );
+    requestId = Number(result.insertId);
+    for (const donor of matching) {
+      eventIds.push(await enqueueNotification(connection, {
+        recipientUserId: donor.userId,
+        recipientRole: 'Donor',
+        title: `${urgency} blood request`,
+        message: `${quantity} units of ${groupLabel(group)} are requested. Consider contacting the requester.`,
+        type: 'BloodRequest',
+        relatedRequestId: requestId,
+        dedupeKey: `request-created:${requestId}:donor:${donor.userId}`
+      }));
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally { connection.release(); }
+  const syncStatus = eventIds.length ? await syncResult(eventIds) : 'synced';
+  res.status(201).json({ requestId, matches: matching.length, syncStatus });
+}));
+
+router.get('/requests/:id', asyncRoute(async (req, res) => {
+  const access = requestDetailAccess(req.user.role, req.user.userId);
+  if (!access.allowed) return res.sendStatus(403);
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid request ID' });
+  const values = [req.params.id, ...access.values];
+  const [rows] = await mysqlPool.execute(
+    `SELECT r.*,b.Blood_Type,b.Rh_Factor FROM BloodRequest r JOIN BloodGroup b USING(BloodGroup_ID)
+      WHERE r.Request_ID=?${access.predicate}`, values
+  );
+  if (!rows[0]) return res.sendStatus(404);
+  res.json({ request: rows[0] });
+}));
+
+router.patch('/requests/:id/status', authorize('Hospital', 'Organization', 'Admin'), asyncRoute(async (req, res) => {
+  const { status } = req.body;
+  if (status !== 'Cancelled') return res.status(400).json({ message: 'Only cancellation is supported here; use /fulfil for inventory-backed fulfillment' });
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid request ID' });
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let request;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute('SELECT * FROM BloodRequest WHERE Request_ID=? FOR UPDATE', [req.params.id]);
+    request = rows[0];
+    if (!request) throw statusError('Request not found', 404);
+    if (req.user.role !== 'Admin') {
+      const owner = await ownerFor(req.user, connection);
+      const ownerId = request.Hospital_ID ? owner.Hospital_ID : owner.Organization_ID;
+      const requestOwner = request.Hospital_ID || request.Organization_ID;
+      if (!ownerId || Number(ownerId) !== Number(requestOwner)) throw statusError('Forbidden', 403);
+    }
+    if (!['Pending', 'Partially_Fulfilled'].includes(request.Request_Status)) throw statusError('Request is already closed', 409);
+    await connection.execute("UPDATE BloodRequest SET Request_Status='Cancelled' WHERE Request_ID=?", [req.params.id]);
+    const recipient = await userForRequestOwner(request, connection);
+    if (recipient) eventIds.push(await enqueueNotification(connection, {
+      recipientUserId: recipient, recipientRole: request.Hospital_ID ? 'Hospital' : 'Organization',
+      title: 'Request cancelled', message: `Request ${request.Request_ID} was cancelled.`,
+      type: 'RequestStatus', relatedRequestId: Number(request.Request_ID),
+      dedupeKey: `request-cancelled:${request.Request_ID}`
+    }));
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  const syncStatus = eventIds.length ? await syncResult(eventIds) : 'synced';
+  const [[updated]] = await mysqlPool.execute('SELECT * FROM BloodRequest WHERE Request_ID=?', [req.params.id]);
+  res.json({ request: updated, syncStatus });
+}));
+
+router.post('/requests/:id/fulfil', authorize('Hospital', 'Admin'), asyncRoute(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid request ID' });
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let request;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute('SELECT * FROM BloodRequest WHERE Request_ID=? FOR UPDATE', [req.params.id]);
+    request = rows[0];
+    if (!request) throw statusError('Request not found', 404);
+    const owner = req.user.role === 'Hospital' ? await ownerFor(req.user, connection) : {};
+    if (!canFulfilHospitalRequest(req.user.role, request.Hospital_ID, owner.Hospital_ID)) {
+      if (!request.Hospital_ID) throw statusError('Only hospital-owned requests can use hospital inventory', 400);
+      throw statusError('Forbidden', 403);
+    }
+    if (request.Request_Status !== 'Pending') throw statusError('Request is not fulfillable', 409);
+    const [inventory] = await connection.execute(
+      'SELECT * FROM BloodInventory WHERE Hospital_ID=? AND BloodGroup_ID=? FOR UPDATE',
+      [request.Hospital_ID, request.BloodGroup_ID]
+    );
+    if (!inventory[0] || Number(inventory[0].Quantity_Available) < Number(request.Quantity_Required)) throw statusError('Insufficient inventory', 409);
+    await connection.execute(
+      'UPDATE BloodInventory SET Quantity_Available=Quantity_Available-?,Last_Updated=NOW() WHERE Inventory_ID=?',
+      [request.Quantity_Required, inventory[0].Inventory_ID]
+    );
+    const [updated] = await connection.execute(
+      "UPDATE BloodRequest SET Request_Status='Fulfilled' WHERE Request_ID=? AND Request_Status='Pending'", [req.params.id]
+    );
+    if (updated.affectedRows !== 1) throw statusError('Request is already closed', 409);
+    const recipient = await userForRequestOwner(request, connection);
+    if (recipient) eventIds.push(await enqueueNotification(connection, {
+      recipientUserId: recipient, recipientRole: 'Hospital', title: 'Request fulfilled',
+      message: `Request ${request.Request_ID} was fulfilled.`, type: 'Fulfilment',
+      relatedRequestId: Number(request.Request_ID), dedupeKey: `request-fulfilled:${request.Request_ID}`
+    }));
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  const syncStatus = eventIds.length ? await syncResult(eventIds) : 'synced';
+  res.json({ status: 'Fulfilled', quantity: Number(request.Quantity_Required), syncStatus });
+}));
+
+router.get('/matching/:bloodGroup', authorize('Hospital', 'Organization', 'Admin'), asyncRoute(async (req, res) => {
+  const { coords, error } = coordinateQuery(req.query);
+  if (error) return res.status(400).json({ message: error });
+  res.json(await matchDonors(req.params.bloodGroup, coords));
+}));
+
+for (const [role, path] of [['Hospital', 'hospitals'], ['Organization', 'organizations']]) {
+  router.get(`/${path}/me/matching/:bloodGroup`, authorize(role), asyncRoute(async (req, res) => {
+    const { coords, error } = coordinateQuery(req.query);
+    if (error) return res.status(400).json({ message: error });
+    const owner = await ownerFor(req.user);
+    if (!owner.Hospital_ID && !owner.Organization_ID) return res.sendStatus(404);
+    res.json(await matchDonors(req.params.bloodGroup, coords));
+  }));
+}
+
+router.post('/donations', authorize('Donor', 'Admin'), asyncRoute(async (req, res) => {
+  const quantity = Number(req.body.quantity);
+  const donationDate = req.body.donationDate || new Date().toISOString().slice(0, 10);
+  const hospitalId = Number(req.body.hospitalId);
+  if (!isPositive(quantity)) return res.status(400).json({ message: 'Quantity must be greater than zero and no more than 999.99' });
+  let canonicalDate;
+  try { canonicalDate = dateOnly(donationDate); } catch { return res.status(400).json({ message: 'Donation date must be a valid YYYY-MM-DD date' }); }
+  if (req.body.status !== undefined && req.body.status !== 'Pending') return res.status(400).json({ message: 'New donations must have Pending status' });
+  if (!Number.isInteger(hospitalId) || hospitalId <= 0) return res.status(400).json({ message: 'A receiving hospital is required' });
+  let donorId = Number(req.body.donorId);
+  if (req.user.role === 'Donor') {
+    const [[donor]] = await mysqlPool.execute('SELECT Donor_ID FROM Donor WHERE User_ID=?', [req.user.userId]);
+    donorId = Number(donor?.Donor_ID);
+  }
+  if (!Number.isInteger(donorId) || donorId <= 0) return res.status(400).json({ message: 'A valid donor is required' });
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let donationId;
+  try {
+    await connection.beginTransaction();
+    const [[hospital]] = await connection.execute('SELECT Hospital_ID FROM Hospital WHERE Hospital_ID=? FOR UPDATE', [hospitalId]);
+    if (!hospital) throw statusError('Receiving hospital not found', 400);
+    const [[donor]] = await connection.execute('SELECT Donor_ID,BloodGroup_ID FROM Donor WHERE Donor_ID=?', [donorId]);
+    if (!donor) throw statusError('Donor not found', 404);
+    const [created] = await connection.execute(
+      `INSERT INTO Donation (Donor_ID,Hospital_ID,BloodGroup_ID,Donation_Date,Quantity,Donation_Status)
+       VALUES (?,?,?,?,?,'Pending')`,
+      [donorId, hospitalId, donor.BloodGroup_ID, canonicalDate, quantity]
+    );
+    donationId = Number(created.insertId);
+    eventIds.push(await enqueueOutbox(connection, {
+      eventType: 'donation.sync', aggregateType: 'donation', aggregateId: donationId,
+      payload: await donationSnapshot(connection, donationId)
+    }));
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  const syncStatus = await syncResult(eventIds);
+  res.status(201).json({ donationId, status: 'Pending', syncStatus });
+}));
+
+router.get('/donations', authorize('Donor', 'Admin', 'Hospital'), asyncRoute(async (req, res) => {
+  let rows;
+  if (req.user.role === 'Donor') {
+    const [[donor]] = await mysqlPool.execute('SELECT Donor_ID FROM Donor WHERE User_ID=?', [req.user.userId]);
+    [rows] = await mysqlPool.execute('SELECT * FROM Donation WHERE Donor_ID=? ORDER BY Donation_Date DESC', [donor?.Donor_ID || 0]);
+  } else if (req.user.role === 'Admin') {
+    [rows] = await mysqlPool.execute('SELECT * FROM Donation ORDER BY Donation_Date DESC');
+  } else {
+    const owner = await ownerFor(req.user);
+    if (!owner.Hospital_ID) return res.json({ donations: [] });
+    [rows] = await mysqlPool.execute('SELECT * FROM Donation WHERE Hospital_ID=? ORDER BY Donation_Date DESC', [owner.Hospital_ID]);
+  }
+  res.json({ donations: rows });
+}));
+
+router.patch('/donations/:id/status', authorize('Admin', 'Hospital'), asyncRoute(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid donation ID' });
+  const { status } = req.body;
+  if (!['Approved', 'Rejected'].includes(status)) return res.status(400).json({ message: 'Status must be Approved or Rejected' });
+  const connection = await mysqlPool.getConnection();
+  const eventIds = [];
+  let donation;
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.execute('SELECT * FROM Donation WHERE Donation_ID=? FOR UPDATE', [req.params.id]);
+    donation = rows[0];
+    if (!donation) throw statusError('Donation not found', 404);
+    if (req.user.role === 'Hospital') {
+      const owner = await ownerFor(req.user, connection);
+      if (!canReviewDonation(req.user.role, donation.Hospital_ID, owner.Hospital_ID)) throw statusError('Donation is not associated with this hospital', 403);
+    }
+    if (donation.Donation_Status !== 'Pending') throw statusError('Donation already processed', 409);
+    await connection.execute('UPDATE Donation SET Donation_Status=? WHERE Donation_ID=?', [status, donation.Donation_ID]);
+
+    // Credit the receiving hospital only when the donation is approved.
+    // This operation shares the same MySQL transaction as the status update.
+    if (status === 'Approved' && donation.Hospital_ID != null) {
+      await connection.execute(
+        `INSERT INTO BloodInventory
+           (Hospital_ID, BloodGroup_ID, Quantity_Available, Last_Updated)
+         VALUES (?, ?, ?, NOW())
+         ON DUPLICATE KEY UPDATE
+           Quantity_Available = Quantity_Available + VALUES(Quantity_Available),
+           Last_Updated = NOW()`,
+        [donation.Hospital_ID, donation.BloodGroup_ID, donation.Quantity]
+      );
+    }
+
+    // The database triggers recalculate Last_Donation_Date from approved donations.
+    const snapshot = await donationSnapshot(connection, donation.Donation_ID);
+    eventIds.push(await enqueueOutbox(connection, {
+      eventType: 'donation.sync', aggregateType: 'donation', aggregateId: donation.Donation_ID, payload: snapshot
+    }));
+    const [[donor]] = await connection.execute('SELECT User_ID FROM Donor WHERE Donor_ID=?', [donation.Donor_ID]);
+    if (donor) eventIds.push(await enqueueNotification(connection, {
+      recipientUserId: donor.User_ID, recipientRole: 'Donor',
+      title: `Donation ${status.toLowerCase()}`,
+      message: `Donation ${donation.Donation_ID} was ${status.toLowerCase()}.`,
+      type: 'DonationStatus', dedupeKey: `donation-status:${donation.Donation_ID}:${status}`
+    }));
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  const syncStatus = await syncResult(eventIds);
+  res.json({ donationId: Number(donation.Donation_ID), status, syncStatus });
+}));
+
+router.get('/notifications', asyncRoute(async (req, res) => {
+  const filter = { recipient_user_id: Number(req.user.userId) };
+  if (req.query.unread === 'true') filter.is_read = false;
+  const notifications = await getMongoDB().collection('Notifications')
+    .find(filter).sort({ created_at: -1 }).limit(100).toArray();
+  res.json({ notifications });
+}));
+
+router.patch('/notifications/:id/read', asyncRoute(async (req, res) => {
+  const { ObjectId } = await import('mongodb');
+  let id;
+  try { id = new ObjectId(req.params.id); } catch { return res.status(400).json({ message: 'Invalid notification ID' }); }
+  const result = await getMongoDB().collection('Notifications').updateOne(
+    { _id: id, recipient_user_id: Number(req.user.userId) }, { $set: { is_read: true } }
+  );
+  res.json({ updated: result.matchedCount === 1 });
+}));
+
+router.get('/admin/summary', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [users] = await mysqlPool.query('SELECT Role,COUNT(*) AS count FROM `User` GROUP BY Role');
+  const [[donors]] = await mysqlPool.query('SELECT COUNT(*) AS count FROM Donor');
+  const [donations] = await mysqlPool.query('SELECT Donation_Status,COUNT(*) AS count FROM Donation GROUP BY Donation_Status');
+  const [requests] = await mysqlPool.query('SELECT Request_Status,COUNT(*) AS count FROM BloodRequest GROUP BY Request_Status');
+  const [[inventory]] = await mysqlPool.query('SELECT COALESCE(SUM(Quantity_Available),0) AS units FROM BloodInventory');
+  res.json({ users, donorCount: donors.count, donations, requests, inventory });
+}));
+
+router.get('/admin/users', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [users] = await mysqlPool.query('SELECT User_ID,Name,Email,Phone,Role FROM `User` ORDER BY User_ID');
+  res.json({ users });
+}));
+
+router.get('/admin/donors', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [donors] = await mysqlPool.query(
+    'SELECT d.Donor_ID,d.User_ID,u.Name,u.Email,d.BloodGroup_ID,d.Availability_Status,d.Last_Donation_Date FROM Donor d JOIN `User` u USING(User_ID)'
+  );
+  res.json({ donors });
+}));
+
+router.get('/admin/requests', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [requests] = await mysqlPool.query(
+    `SELECT br.*, bg.Blood_Type, bg.Rh_Factor
+       FROM BloodRequest br
+       JOIN BloodGroup bg ON bg.BloodGroup_ID = br.BloodGroup_ID
+      ORDER BY br.Request_Date DESC, br.Request_ID DESC`
+  );
+  res.json({ requests });
+}));
+
+router.get('/admin/donations', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [statistics] = await mysqlPool.query(
+    'SELECT Donation_Status,COUNT(*) AS count,COALESCE(SUM(Quantity),0) AS quantity FROM Donation GROUP BY Donation_Status'
+  );
+  res.json({ statistics });
+}));
+
+router.get('/admin/inventory', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [inventory] = await mysqlPool.query(
+    `SELECT h.Hospital_ID,h.Hospital_Name,b.Blood_Type,b.Rh_Factor,i.Inventory_ID,i.Quantity_Available,i.Last_Updated
+       FROM BloodInventory i JOIN Hospital h USING(Hospital_ID) JOIN BloodGroup b USING(BloodGroup_ID)
+      ORDER BY h.Hospital_Name,b.Blood_Type,b.Rh_Factor`
+  );
+  res.json({ inventory });
+}));
+
+router.put('/admin/inventory/:hospitalId/:bloodGroupId', authorize('Admin'), asyncRoute(async (req, res) => {
+  const quantity = Number(req.body.quantity);
+  if (!Number.isFinite(quantity) || quantity < 0 || quantity > 999.99) return res.status(400).json({ message: 'quantity must be between 0 and 999.99' });
+  if (!validId(req.params.hospitalId) || !validId(req.params.bloodGroupId)) return res.status(400).json({ message: 'Invalid hospital or blood group ID' });
+  const connection = await mysqlPool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [hospital] = await connection.execute('SELECT Hospital_ID FROM Hospital WHERE Hospital_ID=? FOR UPDATE', [req.params.hospitalId]);
+    const [group] = await connection.execute('SELECT BloodGroup_ID FROM BloodGroup WHERE BloodGroup_ID=?', [req.params.bloodGroupId]);
+    if (!hospital[0] || !group[0]) throw statusError('Hospital or blood group not found', 404);
+    await connection.execute(
+      `INSERT INTO BloodInventory (Hospital_ID,BloodGroup_ID,Quantity_Available,Last_Updated) VALUES (?,?,?,NOW())
+       ON DUPLICATE KEY UPDATE Quantity_Available=VALUES(Quantity_Available),Last_Updated=NOW()`,
+      [req.params.hospitalId, req.params.bloodGroupId, quantity]
+    );
+    await connection.commit();
+  } catch (error) { await connection.rollback(); throw error; }
+  finally { connection.release(); }
+  res.json({ hospitalId: Number(req.params.hospitalId), bloodGroupId: Number(req.params.bloodGroupId), quantityAvailable: quantity });
+}));
+
+router.get('/admin/organizations', authorize('Admin'), asyncRoute(async (_req, res) => {
+  const [hospitals] = await mysqlPool.query('SELECT * FROM Hospital ORDER BY Hospital_Name');
+  const [organizations] = await mysqlPool.query('SELECT * FROM Organization ORDER BY Organization_Name');
+  res.json({ hospitals, organizations });
+}));
+
+router.get('/admin/integration/status', authorize('Admin'), asyncRoute(async (req, res) => {
+  res.json(await getOutboxStatus({ limit: req.query.limit }));
+}));
+
+router.post('/admin/integration/outbox/:id/retry', authorize('Admin'), asyncRoute(async (req, res) => {
+  if (!validId(req.params.id)) return res.status(400).json({ message: 'Invalid event ID' });
+  const retried = await retryOutboxEvent(req.params.id);
+  if (!retried) return res.status(409).json({ message: 'Event is not failed or does not exist' });
+  const event = await processOutboxOne(Number(req.params.id));
+  res.json({ eventId: Number(req.params.id), status: event?.status || 'Pending' });
+}));
+
+export default router;

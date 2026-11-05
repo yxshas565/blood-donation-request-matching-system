@@ -12,7 +12,7 @@ import { createRateLimiter } from '../middleware/rateLimit.js';
 
 const router = Router();
 const loginLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 10, message: 'Too many login attempts. Try again later.' });
-const registrationLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: 5, message: 'Too many registration attempts. Try again later.' });
+const registrationLimiter = createRateLimiter({ windowMs: 60 * 60 * 1000, max: Number(process.env.REGISTRATION_RATE_LIMIT_MAX || 5), message: 'Too many registration attempts. Try again later.' });
 
 const validate = (req, res, next) => {
     const errors = validationResult(req);

@@ -3,6 +3,7 @@ import { ToastProvider } from './components/ui.jsx';
 import { DashboardLayout, ProtectedRoute } from './components/layout.jsx';
 import LandingPage from './pages/PublicPages.jsx';
 import { LoginPage, RegisterPage } from './pages/AuthPages.jsx';
+import SQLPlaygroundPage from './pages/SQLPlaygroundPage.jsx';
 import { DashboardPage, ProfilePage, RequestsPage, MatchingPage, InventoryPage, DonationsPage, NotificationsPage, AdminTablePage, IntegrationStatusPage } from './pages/WorkspacePages.jsx';
 
 export default function App() {
@@ -22,6 +23,7 @@ export default function App() {
       <Route path="users" element={<ProtectedRoute roles={['Admin']}><AdminTablePage kind="users" /></ProtectedRoute>} />
       <Route path="donors" element={<ProtectedRoute roles={['Admin']}><AdminTablePage kind="donors" /></ProtectedRoute>} />
       <Route path="organizations" element={<ProtectedRoute roles={['Admin']}><AdminTablePage kind="organizations" /></ProtectedRoute>} />
+      <Route path="sql-playground" element={<ProtectedRoute roles={["Admin"]}><SQLPlaygroundPage /></ProtectedRoute>} />
       <Route path="integration" element={<ProtectedRoute roles={['Admin']}><IntegrationStatusPage /></ProtectedRoute>} />
     </Route></Route>
     <Route path="*" element={<Navigate to="/" replace />} />

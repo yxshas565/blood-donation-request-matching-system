@@ -4,6 +4,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import authRoutes from './routes/authRoutes.js';
 import apiRoutes from './routes/apiRoutes.js';
+import sqlPlaygroundRoutes from './routes/sqlPlaygroundRoutes.js';
 import { mysqlPool } from './config/mysql.js';
 import { getMongoDB } from './config/mongodb.js';
 
@@ -11,7 +12,7 @@ const app = express();
 const allowedOrigins = (process.env.CLIENT_URL || 'http://localhost:5173')
   .split(',').map(origin => origin.trim()).filter(Boolean);
 if (process.env.NODE_ENV !== 'production') {
-  for (const origin of ['http://localhost:5173', 'http://localhost:4173', 'http://127.0.0.1:4173']) {
+  for (const origin of ['http://localhost:5173', 'http://localhost:4173', 'http://127.0.0.1:4173', 'http://localhost:3000', 'http://127.0.0.1:3000']) {
     if (!allowedOrigins.includes(origin)) allowedOrigins.push(origin);
   }
 }
@@ -44,6 +45,7 @@ app.get('/api/health', async (_req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api', apiRoutes);
+app.use('/api/sql-playground', sqlPlaygroundRoutes);
 app.use((_req, res) => res.status(404).json({ message: 'API endpoint not found' }));
 app.use((error, _req, res, _next) => {
   const duplicate = error.code === 'ER_DUP_ENTRY';
@@ -55,3 +57,4 @@ app.use((error, _req, res, _next) => {
 });
 
 export default app;
+
